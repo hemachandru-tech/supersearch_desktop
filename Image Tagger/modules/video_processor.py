@@ -28,6 +28,8 @@ from typing import List, Dict, Tuple, Optional
 
 from modules.prompts import get_frame_analysis_prompt, get_final_summary_prompt
 from modules.config import get_face_app, get_classifier, get_label_encoder
+from modules.image_processing import recognize_face
+from modules import frozen_config as FROZEN
 from modules.utils import format_seconds, is_unknown_player, limit_words, limit_chars
 
 try:
@@ -46,11 +48,22 @@ except Exception:
 class VideoProcessor:
     """Complete video processing pipeline with enhanced face detection"""
     
-    # Constants - matching image processing
-    MIN_FACE_SIZE = 98  # Updated to match image processing default
-    CONFIDENCE_THRESHOLD = 99.99
-    SHARPNESS_THRESHOLD = 10  # Updated to match image processing
-    MAX_FACES_LIMIT = 10  # Crowd detection threshold
+    # Recognition constants. These deliberately mirror the image path so a face is
+    # judged the same way whether it arrives as a photo or as a video frame — they are
+    # read from frozen_config rather than duplicated here. The old hardcoded values
+    # (98px faces, 99.99% SVC probability) rejected almost every face in a video frame.
+    MIN_FACE_SIZE = FROZEN.FACE_MIN_SIZE
+    SHARPNESS_THRESHOLD = FROZEN.FACE_MIN_SHARPNESS
+    MAX_FACES_LIMIT = FROZEN.FACE_MAX_FACES
+    COSINE_THRESHOLD = FROZEN.FACE_COSINE_THRESHOLD
+    PRIMARY_ONLY = FROZEN.FACE_PRIMARY_ONLY
+    PRIMARY_AREA_RATIO = FROZEN.FACE_PRIMARY_AREA_RATIO
+
+    # Temporal consensus: a player must appear in at least this many frames (and this
+    # fraction of all extracted frames) before they are tagged on the video. Without it
+    # a single mis-identified frame put a wrong name on the whole clip.
+    PLAYER_MIN_FRAMES = FROZEN.VIDEO_PLAYER_MIN_FRAMES
+    PLAYER_MIN_FRAMES_RATIO = FROZEN.VIDEO_PLAYER_MIN_FRAMES_RATIO
     TRANSCRIBE_MAX_CHARS = int(os.getenv('TRANSCRIBE_MAX_CHARS', '10000'))  # Max transcript length for DB
     
     @staticmethod
@@ -332,22 +345,6 @@ class VideoProcessor:
         
         return [x1, y1, x2, y2]
     
-    @staticmethod
-    def _classifier_expects_normalized(clf) -> bool:
-        """True when the SVM was trained on L2-normalized embeddings (unit-norm support vectors)."""
-        cached = getattr(clf, "_ss_expects_normalized", None)
-        if cached is not None:
-            return cached
-        result = True
-        sv = getattr(clf, "support_vectors_", None)
-        if sv is not None and len(sv):
-            result = bool(abs(float(np.mean(np.linalg.norm(sv, axis=1))) - 1.0) < 0.1)
-        try:
-            clf._ss_expects_normalized = result
-        except Exception:
-            pass
-        return result
-    
     def detect_faces_in_frame(self, frame_path: str) -> Tuple[List[Dict], Optional[str], Optional[str], str, int]:
         """
         Enhanced face detection with rotation support and crowd detection.
@@ -380,8 +377,9 @@ class VideoProcessor:
             
             clf = get_classifier()
             label_encoder = get_label_encoder()
-            normalize = self._classifier_expects_normalized(clf)
             
+            # ---- PASS 1: keep the faces worth identifying (size + sharpness) ----
+            candidates = []
             for face in faces:
                 x1, y1, x2, y2 = face.bbox.astype(int)
                 
@@ -416,27 +414,38 @@ class VideoProcessor:
                 if sharpness < self.SHARPNESS_THRESHOLD:
                     continue
                 
-                # Face recognition (same logic as the tagging code: SVM prediction + probability gate).
-                # Faces below the confidence threshold are dropped, never tagged as "Unknown".
-                embedding = np.asarray(face.embedding, dtype=np.float32)
-                if normalize:
-                    embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
-                predicted_label = clf.predict([embedding])[0]
-                predicted_name = label_encoder.inverse_transform([predicted_label])[0]
+                candidates.append({
+                    'box': (int(x1), int(y1), int(x2), int(y2)),
+                    'area': face_width * face_height,
+                    'embedding': face.embedding,
+                })
+            
+            # ---- Focus on the MAIN SUBJECT(s): drop small background faces ----
+            # Crowd shots in a video otherwise contribute a long tail of tiny, badly-lit
+            # faces, and those are exactly the ones that get misidentified.
+            if self.PRIMARY_ONLY and candidates:
+                max_area = max(c['area'] for c in candidates)
+                candidates = [c for c in candidates
+                              if c['area'] >= self.PRIMARY_AREA_RATIO * max_area]
+            
+            # ---- PASS 2: identify each kept face ----
+            # Uses the same open-set recognition as the image path (closed-set SVM pick
+            # vs. cosine-nearest player, whichever the facial features support better,
+            # gated on cosine similarity to that player's reference templates). A face
+            # that resembles no known player comes back "Unknown" and is dropped, rather
+            # than being forced onto the nearest class as the old SVM-only code did.
+            for c in candidates:
+                x1, y1, x2, y2 = c['box']
+                name, confidence = recognize_face(
+                    c['embedding'], clf, label_encoder, self.COSINE_THRESHOLD
+                )
                 
-                # Get confidence
-                confidence = None
-                if hasattr(clf, "predict_proba"):
-                    proba = clf.predict_proba([embedding])
-                    confidence = np.max(proba) * 100
-                
-                # Filter by confidence threshold
-                if confidence is not None and confidence < self.CONFIDENCE_THRESHOLD:
+                if not name or name == "Unknown":
                     continue
                 
                 detections.append({
-                    'name': predicted_name,
-                    'confidence': float(confidence) if confidence else 0.0,
+                    'name': name,
+                    'confidence': float(confidence or 0.0),
                     'bbox': [int(x1), int(y1), int(x2), int(y2)]
                 })
             
@@ -616,6 +625,22 @@ class VideoProcessor:
         
         return analyses
     
+    @staticmethod
+    def _clean_caption(text: str, max_words: int = 15) -> str:
+        """Reduce a model section to one plain caption of at most `max_words` words.
+
+        Keeps the first non-empty line (the model often lists alternatives), strips
+        bullet markers, markdown emphasis and wrapping quotes, then truncates.
+        """
+        if not text:
+            return ""
+        line = next((l.strip() for l in str(text).splitlines() if l.strip()), "")
+        line = re.sub(r"^[-*\u2022]\s*", "", line)      # bullet marker
+        line = re.sub(r"\*\*(.*?)\*\*", r"\1", line)     # **bold**
+        line = line.strip().strip('"').strip("'").strip()
+        line = limit_words(line, max_words).rstrip(" ,;:-")
+        return line
+
     def parse_summary_response(self, summary_text: str) -> Dict[str, str]:
         """Parse the structured summary response from Gemini"""
         result = {
@@ -682,6 +707,13 @@ class VideoProcessor:
             # Add last section
             if current_section and section_content:
                 result[current_section] = '\n'.join(section_content).strip()
+            
+            # The caption and summary are meant to read like a short photo caption
+            # ("Dhoni playing at nets"). The prompt asks for 15 words, but the model
+            # drifts longer and sometimes returns several bulleted options, so take the
+            # first line and enforce the limit here rather than trusting the model.
+            result['caption'] = self._clean_caption(result['caption'])
+            result['video_summary'] = self._clean_caption(result['video_summary'])
             
             # Ensure no empty values
             if not result['caption']:
@@ -1052,13 +1084,48 @@ class VideoProcessor:
             all_results, frames_with_players = self.detect_faces_sequential(frame_paths)
             
             # Collect all unique players (no_of_faces = count of unique players, not total detections)
-            all_players = set()
+            # ---- Temporal consensus ----
+            # Count how many DISTINCT frames each player appears in, then keep only the
+            # ones seen often enough. A name that shows up in a single frame out of
+            # dozens is a misidentification, not a player in the video.
+            frame_counts = {}
             for frame_result in all_results:
-                for detection in frame_result['detections']:
-                    all_players.add(detection['name'])
+                for name in {d['name'] for d in frame_result['detections']}:
+                    frame_counts[name] = frame_counts.get(name, 0) + 1
             
+            min_frames = max(
+                self.PLAYER_MIN_FRAMES,
+                int(round(self.PLAYER_MIN_FRAMES_RATIO * len(all_results))),
+            ) if all_results else self.PLAYER_MIN_FRAMES
+            
+            # Short clips can legitimately have fewer frames than the floor; fall back to
+            # the busiest player(s) rather than silently tagging nobody.
+            confirmed = {n for n, c in frame_counts.items() if c >= min_frames}
+            if not confirmed and frame_counts:
+                best = max(frame_counts.values())
+                if best > 1:
+                    confirmed = {n for n, c in frame_counts.items() if c == best}
+            
+            rejected = {n: c for n, c in frame_counts.items() if n not in confirmed}
+            if rejected:
+                self.log(f"  ⏳ Temporal consensus (min {min_frames} frames) dropped: "
+                         + ", ".join(f"{n} ({c})" for n, c in sorted(rejected.items())))
+            
+            all_players = confirmed
+            
+            # Drop rejected names from the per-frame detections too. The frames are what
+            # get sent to Gemini, and get_frame_analysis_prompt() names whoever is in
+            # them — so without this a name consensus just rejected still reappears in
+            # the frame descriptions and from there in the caption and summary.
+            if rejected:
+                for frame_result in all_results:
+                    frame_result['detections'] = [d for d in frame_result['detections']
+                                                  if d['name'] in confirmed]
+                frames_with_players = [r for r in all_results if r['detections']]
+            
+            result['player_frame_counts'] = frame_counts
             result['no_of_faces'] = len(all_players)  # Unique players only (e.g. 5 frames same player -> 1)
-            result['player_names'] = sorted(list(all_players))
+            result['player_names'] = sorted(all_players)
             
             # Determine if this is an unknown faces video
             # Videos with no players OR all unknown players should be treated as unknown

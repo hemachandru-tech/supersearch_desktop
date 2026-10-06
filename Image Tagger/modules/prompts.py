@@ -115,6 +115,7 @@ Keep the language SIMPLE and PLAIN, like a short news photo caption. No fancy or
 
 **PRIMARY TAG:** (simple caption, 15 words maximum)
 One short, simple phrase saying who is doing what, and where.
+Return ONE line only — no alternatives, no bullet list, no quotes.
 {"Do NOT invent player names. Use a generic subject (e.g., 'Player', 'Players')." if not all_detected_players else f"USE EXACTLY THESE NAMES for the players: {players_str}."}
 Examples:
 {"- Player batting at nets" if not all_detected_players else "- Dhoni playing at nets"}
@@ -123,6 +124,7 @@ Examples:
 
 **VIDEO SUMMARY:** (one simple sentence, 15 words maximum)
 Say simply who is in the video and what they are doing.
+Return ONE line only — no alternatives, no bullet list, no quotes.
 {"Do NOT invent player names. Use a generic subject (e.g., 'A player', 'Players')." if not all_detected_players else f"USE EXACTLY THESE NAMES for the players: {players_str}."}
 Examples:
 {"- A player practicing batting at the nets." if not all_detected_players else "- Dhoni practicing batting at the nets."}
