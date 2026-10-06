@@ -332,10 +332,26 @@ class VideoProcessor:
         
         return [x1, y1, x2, y2]
     
+    @staticmethod
+    def _classifier_expects_normalized(clf) -> bool:
+        """True when the SVM was trained on L2-normalized embeddings (unit-norm support vectors)."""
+        cached = getattr(clf, "_ss_expects_normalized", None)
+        if cached is not None:
+            return cached
+        result = True
+        sv = getattr(clf, "support_vectors_", None)
+        if sv is not None and len(sv):
+            result = bool(abs(float(np.mean(np.linalg.norm(sv, axis=1))) - 1.0) < 0.1)
+        try:
+            clf._ss_expects_normalized = result
+        except Exception:
+            pass
+        return result
+    
     def detect_faces_in_frame(self, frame_path: str) -> Tuple[List[Dict], Optional[str], Optional[str], str, int]:
         """
         Enhanced face detection with rotation support and crowd detection.
-        Uses the exact same face verification, thresholding, and continuous learning logic as image processing.
+        Player-name logic matches the tagging code (SVM prediction + confidence gate).
         Returns: (detections, annotated_path, skip_reason, orientation, rotation_applied)
         """
         try:
@@ -352,28 +368,20 @@ class VideoProcessor:
             # Use rotation-aware face detection
             faces, rotation_angle = self.detect_faces_with_rotation(frame_rgb, orientation)
             
-            # FROZEN recognition parameters (single source of truth: modules/frozen_config.py).
-            from modules import frozen_config as FROZEN
-            CONFIDENCE_THRESHOLD = FROZEN.FACE_CONFIDENCE_THRESHOLD
-            MARGIN_THRESHOLD = FROZEN.FACE_MARGIN
-            SHARPNESS_THRESHOLD = FROZEN.FACE_MIN_SHARPNESS
-            MIN_FACE_SIZE = FROZEN.FACE_MIN_SIZE
-            PRIMARY_ONLY = FROZEN.FACE_PRIMARY_ONLY
-            PRIMARY_AREA_RATIO = FROZEN.FACE_PRIMARY_AREA_RATIO
-            MAX_FACES_LIMIT = FROZEN.FACE_MAX_FACES
-            
             # Check if too many faces (crowded scene)
-            if len(faces) > MAX_FACES_LIMIT:
+            if len(faces) > self.MAX_FACES_LIMIT:
                 skip_reason = f"crowd_detected_{len(faces)}_faces"
                 return [], None, skip_reason, orientation, rotation_angle
             
             if not faces:
                 return [], None, None, orientation, rotation_angle
             
-            total_faces_detected = len(faces)
+            detections = []
             
-            # ---- PASS 1: keep only geometrically-valid, IN-FOCUS faces ----
-            candidates = []
+            clf = get_classifier()
+            label_encoder = get_label_encoder()
+            normalize = self._classifier_expects_normalized(clf)
+            
             for face in faces:
                 x1, y1, x2, y2 = face.bbox.astype(int)
                 
@@ -389,56 +397,49 @@ class VideoProcessor:
                 # Ensure valid crop
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(frame_rgb.shape[1], x2), min(frame_rgb.shape[0], y2)
+                
                 if x2 <= x1 or y2 <= y1:
                     continue
                 
+                # Check minimum face size
                 face_width = x2 - x1
                 face_height = y2 - y1
-                if face_width < MIN_FACE_SIZE or face_height < MIN_FACE_SIZE:
+                
+                if face_width < self.MIN_FACE_SIZE or face_height < self.MIN_FACE_SIZE:
                     continue
+                
+                # Extract face crop
+                face_crop = frame_rgb[y1:y2, x1:x2]
                 
                 # Check sharpness
-                face_crop = frame_rgb[y1:y2, x1:x2]
-                if self.compute_sharpness(face_crop) < SHARPNESS_THRESHOLD:
+                sharpness = self.compute_sharpness(face_crop)
+                if sharpness < self.SHARPNESS_THRESHOLD:
                     continue
                 
-                candidates.append({
-                    "box": (x1, y1, x2, y2),
-                    "area": face_width * face_height,
-                    "embedding": face.embedding
-                })
-            
-            if not candidates:
-                return [], None, None, orientation, rotation_angle
-            
-            # ---- Focus on the MAIN SUBJECT(s): drop small background faces ----
-            if PRIMARY_ONLY:
-                max_area = max(c["area"] for c in candidates)
-                candidates = [c for c in candidates if c["area"] >= PRIMARY_AREA_RATIO * max_area]
+                # Face recognition (same logic as the tagging code: SVM prediction + probability gate).
+                # Faces below the confidence threshold are dropped, never tagged as "Unknown".
+                embedding = np.asarray(face.embedding, dtype=np.float32)
+                if normalize:
+                    embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
+                predicted_label = clf.predict([embedding])[0]
+                predicted_name = label_encoder.inverse_transform([predicted_label])[0]
                 
-            # ---- PASS 2: identify each kept face (with cross-verification) ----
-            detections = []
-            
-            clf = get_classifier()
-            label_encoder = get_label_encoder()
-            
-            for c in candidates:
-                x1, y1, x2, y2 = c["box"]
-                embedding = c["embedding"]
+                # Get confidence
+                confidence = None
+                if hasattr(clf, "predict_proba"):
+                    proba = clf.predict_proba([embedding])
+                    confidence = np.max(proba) * 100
                 
-                from modules.image_processing import recognize_face
-                # Re-use the exact same recognition logic as image_processing (L2 norm + Cosine verify + SVM)
-                name, confidence = recognize_face(embedding, clf, label_encoder, FROZEN.FACE_COSINE_THRESHOLD)
+                # Filter by confidence threshold
+                if confidence is not None and confidence < self.CONFIDENCE_THRESHOLD:
+                    continue
                 
-                # NOTE: Continuous-learning override removed in Phase 1 freeze.
-                # Recognition relies solely on the frozen model (read-only inference).
-
                 detections.append({
-                    'name': name,
-                    'confidence': float(confidence),
+                    'name': predicted_name,
+                    'confidence': float(confidence) if confidence else 0.0,
                     'bbox': [int(x1), int(y1), int(x2), int(y2)]
                 })
-                
+            
             # Create annotated frame if faces detected
             annotated_path = None
             skip_reason = None
@@ -716,8 +717,6 @@ class VideoProcessor:
             }
         
         self.log(f"→ Generating final summary...")
-        if is_unknown_faces:
-            self.log(f"  Limiting to 15 words for unknown faces video")
         
         try:
             # Prepare frame analyses
@@ -747,10 +746,9 @@ class VideoProcessor:
             if response and response.text:
                 parsed = self.parse_summary_response(response.text)
                 
-                # Limit words for unknown faces videos
-                if is_unknown_faces:
-                    parsed['caption'] = limit_words(parsed.get('caption', ''), 15)
-                    parsed['video_summary'] = limit_words(parsed.get('video_summary', ''), 15)
+                # Caption and summary are always short and simple (max 15 words)
+                parsed['caption'] = limit_words(parsed.get('caption', '').strip().strip('"\'*'), 15)
+                parsed['video_summary'] = limit_words(parsed.get('video_summary', '').strip().strip('"\'*'), 15)
                 
                 self.log(f"✓ Summary generated\n")
                 return parsed
@@ -762,7 +760,7 @@ class VideoProcessor:
             default_summary = 'Cricket Video' if not is_unknown_faces else 'Cricket Scene'
             return {
                 'caption': default_summary,
-                'video_summary': f'Error generating summary: {str(e)}' if not is_unknown_faces else limit_words(f'Error: {str(e)}', 15),
+                'video_summary': 'Cricket video',
                 'activities': 'Processing error',
                 'keywords': 'cricket'
             }
@@ -1053,31 +1051,14 @@ class VideoProcessor:
             self.log("-" * 60)
             all_results, frames_with_players = self.detect_faces_sequential(frame_paths)
             
-            # Collect all unique players with temporal consensus
-            from collections import Counter
-            player_counts = Counter()
+            # Collect all unique players (no_of_faces = count of unique players, not total detections)
+            all_players = set()
             for frame_result in all_results:
                 for detection in frame_result['detections']:
-                    player_counts[detection['name']] += 1
+                    all_players.add(detection['name'])
             
-            from modules import frozen_config as FROZEN
-            min_frames_abs = getattr(FROZEN, 'VIDEO_PLAYER_MIN_FRAMES', 2)
-            min_frames_ratio = getattr(FROZEN, 'VIDEO_PLAYER_MIN_FRAMES_RATIO', 0.05)
-            
-            total_frames = len(frame_paths)
-            required_frames = max(min_frames_abs, int(total_frames * min_frames_ratio))
-            
-            final_players = set()
-            self.log(f"\n  [Temporal Consensus] Total frames: {total_frames}, Required: {required_frames}")
-            for player, count in player_counts.items():
-                if count >= required_frames:
-                    final_players.add(player)
-                    self.log(f"    ✓ {player} -> {count} frames -> INCLUDED")
-                else:
-                    self.log(f"    ✗ {player} -> {count} frames -> EXCLUDED (filtered out)")
-                    
-            result['no_of_faces'] = len(final_players)
-            result['player_names'] = sorted(list(final_players))
+            result['no_of_faces'] = len(all_players)  # Unique players only (e.g. 5 frames same player -> 1)
+            result['player_names'] = sorted(list(all_players))
             
             # Determine if this is an unknown faces video
             # Videos with no players OR all unknown players should be treated as unknown

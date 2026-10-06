@@ -105,30 +105,28 @@ def get_final_summary_prompt(frame_analyses, all_detected_players, is_unknown_fa
     else:
         players_context = "with no detected players"
 
-    tag_word_limit = "5 words maximum"
-
     prompt = f"""You analyzed multiple frames from a cricket video {players_context}
 
 Frame-by-frame observations:
 {analysis_context}
 
-Create a STRUCTURED VIDEO SUMMARY with these sections:
+Create a STRUCTURED VIDEO SUMMARY with these sections.
+Keep the language SIMPLE and PLAIN, like a short news photo caption. No fancy or commentary-style words.
 
-**PRIMARY TAG:** ({tag_word_limit})
-Create one collated tag that represents the overall video content.
-{"Format: [Scene/Activity Description] (no player names)" if not all_detected_players else "Format: [Player Names] + [Primary Activity]"}
+**PRIMARY TAG:** (simple caption, 15 words maximum)
+One short, simple phrase saying who is doing what, and where.
+{"Do NOT invent player names. Use a generic subject (e.g., 'Player', 'Players')." if not all_detected_players else f"USE EXACTLY THESE NAMES for the players: {players_str}."}
 Examples:
-{"- 'Cricket Field Scene'" if not all_detected_players else "- 'Dhoni Rayudu Nets Practice'"}
-{"- 'Training Equipment Setup'" if not all_detected_players else "- 'Kohli Sharma Catching Drill'"}
-{"- 'Stadium View'" if not all_detected_players else "- 'Team Celebration Moment'"}
+{"- Player batting at nets" if not all_detected_players else "- Dhoni playing at nets"}
+{"- Players doing catching drill" if not all_detected_players else "- Dhoni and Raina batting at nets"}
+{"- Players warming up on the ground" if not all_detected_players else "- Jadeja bowling during practice"}
 
-**VIDEO SUMMARY:** (1 sentence, 10-20 words)
-Provide a short, direct description of who is in the video and what they are doing based on the activities observed.
+**VIDEO SUMMARY:** (one simple sentence, 15 words maximum)
+Say simply who is in the video and what they are doing.
 {"Do NOT invent player names. Use a generic subject (e.g., 'A player', 'Players')." if not all_detected_players else f"USE EXACTLY THESE NAMES for the players: {players_str}."}
-Format: [Player Names or Generic Subject] is/are seen [activity] [context].
 Examples:
-{"- A player is seen practicing batting in the nets." if not all_detected_players else "- MS Dhoni is seen practicing batting in the nets."}
-{"- Players are seen participating in a training session." if not all_detected_players else "- Ruturaj Gaikwad and MS Dhoni are seen batting during a training session."}
+{"- A player practicing batting at the nets." if not all_detected_players else "- Dhoni practicing batting at the nets."}
+{"- Players taking part in a training session." if not all_detected_players else "- Dhoni and Gaikwad batting during a training session."}
 
 **SEARCHABLE KEYWORDS:**
 Provide 8-10 relevant keywords for categorization:

@@ -281,6 +281,8 @@ class LocalTaggingPipeline:
 
         # Progress state (read by the UI)
         self._lock = threading.Lock()
+        # VideoProcessor shares one temp frames folder, so only one video may be processed at a time.
+        self._video_lock = threading.Lock()
         self.stop_requested = False
         self.reset_progress()
 
@@ -516,7 +518,6 @@ class LocalTaggingPipeline:
         try:
             # 2. Lazy init video processor
             vp = self.ensure_video_processor()
-            vp.log_callback = self._log
             
             # 3. Call process_single_video
             video_info = {
@@ -531,7 +532,9 @@ class LocalTaggingPipeline:
                 def __bool__(self):
                     return self.pipe.stop_requested
 
-            res = vp.process_single_video(video_info, shutdown_flag_ref=ShutdownRef(self))
+            with self._video_lock:
+                vp.log_callback = self._log
+                res = vp.process_single_video(video_info, shutdown_flag_ref=ShutdownRef(self))
             
             if res.get("status") == "error":
                 record["status"] = "error"
@@ -544,25 +547,12 @@ class LocalTaggingPipeline:
                 record["action"] = res.get("action") or "Standing"
                 record["embedded_tags"] = res.get("keywords") or ""
                 
-                # collate summary + transcription inside caption
-                base_caption = generate_editorial_caption(
-                    players=record["player_names"],
-                    team=team_context,
-                    tournament=tournament_context or self.tournament_name,
-                    event=record["event_type"],
-                    action=record["action"],
-                    date_str=res.get("datetime", "")
-                )
-                summary_text = res.get("video_summary") or ""
-                transcribe_text = res.get("transcribe") or ""
-                
-                full_caption = base_caption
-                if summary_text:
-                    full_caption += "\n\nSummary:\n" + summary_text
-                if transcribe_text:
-                    full_caption += "\n\nTranscript:\n" + transcribe_text
-                    
-                record["caption"] = full_caption
+                # Simple, short caption (max 15 words), e.g. "Dhoni playing at nets"
+                from modules.utils import limit_words
+                caption = (res.get("caption") or "").strip()
+                if not caption or caption.lower() in ("cricket video", "cricket scene"):
+                    caption = (res.get("video_summary") or "").strip() or caption or "Cricket video"
+                record["caption"] = limit_words(caption, 15)
                 
                 # set datetime/date/time of day
                 record["date_time_original"] = res.get("datetime")
