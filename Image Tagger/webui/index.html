@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+<script>
+window.addEventListener('error', function(e) {
+  document.body.innerHTML += '<div style="color:red; background:black; padding:20px; z-index:9999; position:absolute; top:0; left:0; width:100%">' + e.message + '<br>' + e.filename + ':' + e.lineno + '</div>';
+});
+</script>
+
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Super Search Desktop</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Hanken+Grotesk:wght@400;500;600;700;800&family=Archivo:wght@600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="ss/styles.css" />
+<link rel="stylesheet" href="ss/screens.css" />
+</head>
+<body>
+<div id="root"></div>
+
+<template id="__bundler_thumbnail">
+  <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+    <rect width="100" height="100" fill="#14161D" />
+    <circle cx="44" cy="44" r="20" fill="none" stroke="#FFC72C" stroke-width="6" />
+    <line x1="58" y1="58" x2="74" y2="74" stroke="#FFC72C" stroke-width="6" stroke-linecap="round" />
+  </svg>
+</template>
+
+<!-- React / ReactDOM / Babel are vendored locally (webui/vendor/) so the app renders
+     fully offline and without any CDN/firewall dependency. -->
+<script src="vendor/react.production.min.js"></script>
+<script src="vendor/react-dom.production.min.js"></script>
+<script src="vendor/babel.min.js"></script>
+
+<script src="ss/icons.js"></script>
+<script src="ss/data.js"></script>
+<script src="ss/api.js"></script>
+<!-- tweaks-panel.jsx provides the useTweaks() theme-persistence hook. The visible dev
+     "Tweaks" panel is not rendered in the client build (see App below). -->
+<script type="text/babel" src="ss/tweaks-panel.jsx"></script>
+<script type="text/babel" src="ss/components.jsx"></script>
+<script type="text/babel" src="ss/screen-library.jsx"></script>
+<script type="text/babel" src="ss/screen-detail.jsx"></script>
+<script type="text/babel" src="ss/screen-tag.jsx"></script>
+<script type="text/babel" src="ss/screen-players.jsx"></script>
+<script type="text/babel" src="ss/screen-review.jsx"></script>
+<script type="text/babel" src="ss/screen-table.jsx"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+
+const ACCENTS = {
+  'CSK Yellow': { a: '#FFC72C', hover: '#FFD24D', press: '#F0B400', on: '#1A1606' },
+  'Royal Blue': { a: '#4F8DF7', hover: '#6BA0FF', press: '#3D78DE', on: '#0A1326' },
+  'Emerald':    { a: '#34C98A', hover: '#4BD89E', press: '#27AE77', on: '#04140D' },
+  'Sunset':     { a: '#F7913B', hover: '#FFA85C', press: '#E07E2A', on: '#1F1003' },
+  'Crimson':    { a: '#F0626B', hover: '#FF7A83', press: '#D94E57', on: '#1F0608' },
+  'Violet':     { a: '#A78BFA', hover: '#BBA4FF', press: '#9272F0', on: '#120825' },
+};
+
+function applyTheme(theme, accentName) {
+  const root = document.documentElement;
+  root.setAttribute('data-theme', theme);
+  const ac = ACCENTS[accentName] || ACCENTS['CSK Yellow'];
+  root.style.setProperty('--accent', ac.a);
+  root.style.setProperty('--accent-hover', ac.hover);
+  root.style.setProperty('--accent-press', ac.press);
+  root.style.setProperty('--on-accent', ac.on);
+  root.style.setProperty('--accent-soft', `color-mix(in srgb, ${ac.a} ${theme === 'light' ? '20%' : '15%'}, transparent)`);
+  root.style.setProperty('--accent-line', `color-mix(in srgb, ${ac.a} 32%, transparent)`);
+}
+
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "theme": "light",
+  "accent": "CSK Yellow"
+}/*EDITMODE-END*/;
+
+function App() {
+  const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+  const [screen, setScreen] = useState('library');
+  const [images, setImages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [sel, setSel] = useState(null);
+  const [rosterReady, setRosterReady] = useState(false);
+  const [nav, setNav] = useState(null);   // viewer Prev/Next context: { list, index, syncPage }
+
+  // Brand-locked appearance: always Light theme + CSK Yellow accent.
+  // (The Appearance switcher was removed for the client build.)
+  useEffect(() => { applyTheme('light', 'CSK Yellow'); }, []);
+
+  function mapDbRowToUi(row) {
+    let faces = [];
+    if (row.faces_json) {
+      try {
+        faces = JSON.parse(row.faces_json);
+      } catch (e) {
+        console.error("Error parsing faces_json:", e);
+      }
+    }
+    
+    const players = row.player_names ? row.player_names.split(',').map(s => s.trim()).filter(Boolean) : [];
+    if (faces.length === 0 && players.length > 0) {
+      faces = players.map(p => ({
+        name: p,
+        conf: 1.0,
+        status: 'confirmed',
+        bbox: [0, 0, 0, 0]
+      }));
+    }
+    
+    const file = row.file_name || '';
+    const ext = file.split('.').pop().toLowerCase();
+    
+    const starredIds = JSON.parse(localStorage.getItem('starred_ids') || '[]');
+    const starred = starredIds.includes(row.id);
+
+    // Original capture date/time. EXIF stores "YYYY:MM:DD HH:MM:SS"; normalise to
+    // "YYYY-MM-DD · HH:MM". Falls back to the plain `date` column, else blank.
+    const _rawDate = row.date_time_original || row.date || '';
+    const _dm = String(_rawDate).match(/^(\d{4})[:\-](\d{2})[:\-](\d{2})(?:[ T]+(\d{2}:\d{2}))?/);
+    const dateOriginal = _dm ? `${_dm[1]}-${_dm[2]}-${_dm[3]}${_dm[4] ? ' · ' + _dm[4] : ''}` : String(_rawDate || '');
+
+    return {
+      id: row.id,
+      file: file,
+      folder: row.folder || '',
+      format: ext,
+      dateOriginal: dateOriginal,
+      players: players,
+      event: row.event_type || '',
+      mood: row.mood || '',
+      action: row.action || '',
+      location: row.location || '',
+      jersey: row.jersey_color || '',
+      apparel: row.apparel || '',
+      crowd: row.crowd_present || 'No',
+      caption: row.caption || '',
+      logos_branding: row.logos_branding || '',
+      tournament: row.tournament || '',
+      shot_type: row.shot_type || '',
+      focus: row.focus || '',
+      time_of_day: row.time_of_day || '',
+      embedded: row.metadata_written === 1,
+      error: row.status === 'error',
+      width: row.width || 0,
+      height: row.height || 0,
+      faces: faces,
+      starred: starred,
+    };
+  }
+
+  async function loadData() {
+    try {
+      const filters = await window.api.filters();
+      // LIBRARY filters: only values present in currently-tagged content (auto-refreshes
+      // every time loadData runs — after tagging, edits, or Refresh Library).
+      window.SS_DATA.LIB = {
+        players:     filters.players || [],
+        events:      filters.events || [],
+        moods:       filters.moods || [],
+        actions:     filters.actions || [],
+        jerseyTypes: filters.jersey_types || [],
+        locations:   filters.locations || [],
+      };
+      // EDIT-TAGS master scene taxonomy (complete lists, no model needed).
+      const _m = filters.master || {};
+      window.SS_DATA.EVENTS = _m.events || window.SS_DATA.EVENTS;
+      window.SS_DATA.MOODS = _m.moods || window.SS_DATA.MOODS;
+      window.SS_DATA.ACTIONS = _m.actions || window.SS_DATA.ACTIONS;
+      window.SS_DATA.LOCATIONS = _m.locations || window.SS_DATA.LOCATIONS;
+      window.SS_DATA.JERSEY_TYPES = _m.jersey_types || window.SS_DATA.JERSEY_TYPES;
+      // Master player ROSTER is loaded lazily (ensureRoster) on first Edit/Review — it
+      // needs the sklearn classifier, which we keep off the startup path.
+
+      const res = await window.api.search("", { limit: 10000 });
+      const mapped = (res.results || []).map(mapDbRowToUi);
+      setImages(mapped);
+      
+      const statusRes = await fetch('/api/status').then(r => r.json()).catch(() => ({}));
+      window.SS_DATA.STATUS.total = mapped.length;
+      window.SS_DATA.STATUS.tagged = mapped.filter(i => i.embedded && !i.error).length;
+      window.SS_DATA.STATUS.exiftool = statusRes.metadata_backend ? statusRes.metadata_backend.includes('exiftool') : false;
+      window.SS_DATA.STATUS.geminiKeys = statusRes.api_keys || 0;
+    } catch (err) {
+      console.error("Error loading library data:", err);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadData();
+  }, []);
+
+  // Heartbeat loop to keep backend server alive. If window/tab is closed,
+  // server will automatically shutdown after 90s of no heartbeats.
+  useEffect(() => {
+    const sendHeartbeat = () => {
+      fetch('/api/heartbeat').catch(() => {});
+    };
+    sendHeartbeat();
+    const interval = setInterval(sendHeartbeat, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const reviewQueue = useMemo(() => {
+    const q = [];
+    images.forEach(rec => (rec.faces || []).forEach((face, fi) => {
+      if (face.status === 'review') q.push({ rec, face, fi });
+    }));
+    return q;
+  }, [images]);
+
+  const tagged = images.filter(i => i.embedded && !i.error).length;
+  const favCount = images.filter(i => i.starred).length;
+  const counts = { library: images.length, favorites: favCount, review: reviewQueue.length, tagged, total: images.length };
+
+  function starImg(id) {
+    const starredIds = JSON.parse(localStorage.getItem('starred_ids') || '[]');
+    let starred = starredIds.includes(id);
+    if (starred) {
+      const idx = starredIds.indexOf(id);
+      starredIds.splice(idx, 1);
+      starred = false;
+    } else {
+      starredIds.push(id);
+      starred = true;
+    }
+    localStorage.setItem('starred_ids', JSON.stringify(starredIds));
+
+    setImages(imgs => imgs.map(i => i.id === id ? { ...i, starred } : i));
+    setSel(s => s && s.id === id ? { ...s, starred } : s);
+  }
+
+  function saveImg(updated) {
+    loadData();
+    setSel(null);
+  }
+
+  // Refresh Library: sync the index with the source folders on disk (prune deleted,
+  // re-index already-tagged new files). Never runs AI or touches any model.
+  async function refreshLibrary() {
+    const res = await window.api.refresh();
+    await loadData();
+    const parts = [];
+    parts.push(`${res.removed || 0} deleted photo(s) removed`);
+    parts.push(`${res.added || 0} existing-tagged photo(s) added`);
+    if (res.new_untagged) parts.push(`${res.new_untagged} new untagged photo(s) found — use “Tag photos” to tag them`);
+    alert('Library refreshed.\n\n' + parts.join('\n') + `\n\nTotal in library: ${res.total}`);
+    return res;
+  }
+
+  // Lazily fetch the master player roster on first Edit/Review. Loads only the light
+  // sklearn classifier (never InsightFace/Torch), then re-renders so the open panel's
+  // player picker shows suggestions. Cached for the rest of the session.
+  const rosterFetched = React.useRef(false);
+  async function ensureRoster() {
+    if (rosterFetched.current) return;
+    rosterFetched.current = true;
+    try {
+      const r = await window.api.roster();
+      window.SS_DATA.ROSTER = r.players || window.SS_DATA.ROSTER;
+      setRosterReady(true);
+    } catch (e) { rosterFetched.current = false; }
+  }
+  // Open the media viewer. `list` is the ordered result set the item belongs to
+  // (filtered + sorted), so Prev/Next traverse that exact set; `syncPage` keeps the
+  // grid's pagination in step as you cross page boundaries. Uses the already-loaded
+  // dataset — no refetch, no full-page reload.
+  function openDetail(rec, list, syncPage) {
+    ensureRoster();
+    const arr = (Array.isArray(list) && list.length) ? list : [rec];
+    let idx = arr.findIndex(r => r.id === rec.id);
+    if (idx < 0) idx = 0;
+    setNav({ list: arr, index: idx, syncPage: syncPage || null });
+    setSel(rec);
+  }
+  function navTo(delta) {
+    if (!nav) return;
+    const ni = nav.index + delta;
+    if (ni < 0 || ni >= nav.list.length) return;
+    if (nav.syncPage) nav.syncPage(ni);          // preserve page context behind the viewer
+    setNav({ ...nav, index: ni });
+    setSel(nav.list[ni]);                         // swap item only — viewer stays mounted
+  }
+  function closeDetail() { setSel(null); setNav(null); }
+
+  // Review screen also needs the roster (name-correction dropdown).
+  useEffect(() => { if (screen === 'review') ensureRoster(); }, [screen]);
+
+  function resolveFace(item, action, name) {
+    window.api.resolveFace({ image_id: item.rec.id, face_index: item.fi, action, name })
+      .then(res => {
+        if (res.ok) {
+          loadData();
+        } else {
+          alert("Failed to resolve face: " + res.error);
+        }
+      })
+      .catch(err => alert("Failed to resolve face: " + err.message));
+  }
+
+  if (loading) {
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#0F1115', color: '#fff', fontFamily: 'sans-serif' }}>
+        <div style={{ textAlign: 'center' }}>
+          <div className="spin" style={{ width: 40, height: 40, border: '4px solid rgba(255,255,255,0.1)', borderTopColor: '#FFC72C', borderRadius: '50%', animation: 'spin 1s linear infinite', margin: '0 auto 16px' }} />
+          <h3>Loading Super Search Desktop…</h3>
+        </div>
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      </div>
+    );
+  }
+
+  return (
+    <div className="app">
+      <TitleBar screen={screen} />
+      <div className="body">
+        <Sidebar screen={screen} setScreen={setScreen} counts={counts} />
+        <main className="main">
+          {screen === 'library' && <LibraryScreen images={images} onOpen={openDetail} onStar={starImg} onRefresh={refreshLibrary} />}
+          {screen === 'favorites' && <LibraryScreen images={images.filter(i => i.starred)} onOpen={openDetail} onStar={starImg} favoritesOnly />}
+          {screen === 'table' && <TableScreen images={images} onOpen={openDetail} />}
+          {screen === 'tag' && <TagScreen images={images} onIndexed={loadData} />}
+          {screen === 'players' && <PlayersScreen />}
+          {screen === 'review' && <ReviewScreen queue={reviewQueue} onResolve={resolveFace} onOpenDetail={openDetail} />}
+          {/* {screen === 'collage' && (
+            <div className="empty" style={{ margin: 'auto' }}>
+              <div className="empty-icon"><Icon name="layers" size={28} stroke={1.4} /></div>
+              <h3>Collage Studio coming soon</h3>
+              <p>Create visually stunning AI collages from your tagged images using natural language prompts.</p>
+            </div>
+          )} */}
+        </main>
+      </div>
+      {sel && <DetailPanel rec={sel} onClose={closeDetail} onSave={saveImg} onStar={starImg}
+        onPrev={() => navTo(-1)} onNext={() => navTo(1)}
+        hasPrev={!!nav && nav.index > 0} hasNext={!!nav && nav.index < nav.list.length - 1}
+        navPos={nav ? nav.index + 1 : 0} navCount={nav ? nav.list.length : 0} />}
+      {/* Developer "Tweaks" panel removed for the client build. Theme & accent are
+          available to end users via the Appearance menu in the title bar. */}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

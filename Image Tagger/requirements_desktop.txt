@@ -1,0 +1,37 @@
+# Super Search Desktop - Python packages
+# Install everything with:   pip install -r requirements_desktop.txt
+
+# --- Web backend + desktop window ---
+fastapi
+uvicorn
+pywebview            # the desktop window (if it fails to install, the app opens in your browser)
+
+# --- Core utilities ---
+python-dotenv
+pillow               # image reading + thumbnails
+pillow-heif          # iPhone HEIC support
+piexif               # writes tags into JPEG/TIFF (Windows Properties) - no ExifTool needed
+rawpy                # decode RAW (.arw/.dng/.cr2/...) when no embedded preview / no ExifTool
+
+# --- Video analysis + tagging (mp4/mov/...) ---
+imageio-ffmpeg       # bundled ffmpeg: frame extraction (no system ffmpeg needed)
+imageio
+faster-whisper       # speech-to-text transcript for videos
+
+# --- AI tagging (Gemini) ---
+google-genai
+
+# --- Face recognition (player names) ---
+torch
+torchvision
+insightface
+onnxruntime
+scikit-learn
+joblib
+opencv-python
+numpy<2          # torch/insightface/onnxruntime wheels are built against NumPy 1.x;
+                 # numpy>=2 triggers an ABI-incompatibility warning and risks crashes.
+pandas
+
+# NOTE: For PNG / HEIC / RAW / .ARW metadata embedding, also install ExifTool
+# (a single .exe, no Python needed) - see SETUP_GUIDE.md, Step 4.
