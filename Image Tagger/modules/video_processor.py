@@ -48,9 +48,7 @@ class VideoProcessor:
     
     # Constants - matching image processing
     MIN_FACE_SIZE = 98  # Updated to match image processing default
-    # SVM-probability gate. 99.99 (tagging code) suits its model; SuperSearch's linear-SVC models
-    # top out around 90-95% on clean matches, so use the frozen video gate (75).
-    CONFIDENCE_THRESHOLD = 75.0
+    CONFIDENCE_THRESHOLD = 99.99
     SHARPNESS_THRESHOLD = 10  # Updated to match image processing
     MAX_FACES_LIMIT = 10  # Crowd detection threshold
     TRANSCRIBE_MAX_CHARS = int(os.getenv('TRANSCRIBE_MAX_CHARS', '10000'))  # Max transcript length for DB
