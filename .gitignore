@@ -4,3 +4,15 @@ __pycache__/
 .DS_Store
 temp_frames/
 temp_annotated/
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime state — created by the app, not source
+tags.db
+tags.db-shm
+tags.db-wal
+app_state.json
+cricket_analysis_progress.db
+*.log

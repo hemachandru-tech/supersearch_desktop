@@ -855,27 +855,35 @@ def api_get_active_model():
     if active_db:
         return JSONResponse(active_db)
         
-    # Legacy Model
-    from modules.config import FACE_MODEL_PATH
+    # No model activated yet (fresh install): report the shipped model that
+    # modules.config will actually load, so this screen matches what tagging uses.
+    from modules.config import FACE_MODEL_PATH, LEGACY_FACE_MODEL_PATH
     import os, joblib, datetime
     if os.path.exists(FACE_MODEL_PATH):
         try:
             data = joblib.load(FACE_MODEL_PATH)
             clf = data.get("model")
             label_encoder = data.get("label_encoder")
-            players = len(label_encoder.classes_) if label_encoder else 0
-            
-            # Legacy uses support vectors as reference templates
-            samples = sum(clf.n_support_) if hasattr(clf, "n_support_") else 0
-            
+            embeddings = data.get("embeddings")
+            players = len(label_encoder.classes_) if label_encoder is not None else 0
+
+            # Newer models store their training embeddings; the legacy model does not,
+            # so fall back to counting support vectors as reference templates.
+            if embeddings is not None:
+                samples = len(embeddings)
+            else:
+                samples = sum(clf.n_support_) if hasattr(clf, "n_support_") else 0
+
+            is_legacy = os.path.abspath(FACE_MODEL_PATH) == os.path.abspath(LEGACY_FACE_MODEL_PATH)
             mtime = os.path.getmtime(FACE_MODEL_PATH)
             return JSONResponse({
                 "id": "legacy",
-                "version_name": "Existing / Legacy Model",
+                "version_name": ("Existing / Legacy Model" if is_legacy
+                                 else os.path.splitext(os.path.basename(FACE_MODEL_PATH))[0]),
                 "players_count": players,
                 "samples_count": samples,
                 "created_at": datetime.datetime.fromtimestamp(mtime).isoformat(),
-                "status": "LEGACY"
+                "status": "LEGACY" if is_legacy else "SHIPPED"
             })
         except Exception as e:
             print(e)
